@@ -50,16 +50,6 @@ streamlit run app.py
 ```
 This opens a browser tab automatically (usually `http://localhost:8501`). If it doesn't open automatically, copy that URL into your browser.
 
-### 7. Using the app for your demo
-- Set your starting capital, profit goal %, loss limit %, and other parameters in the left sidebar
-- Click **Run Simulation**
-- Use the sidebar **Page** selector to switch between: Market, Overview, Agents, Agent Detail
-- On the Agent Detail page, pick any agent from the dropdown to see its genome, portfolio chart, and full day-by-day decision log ("thinking")
-
-## Presentation tips
-- Run the simulation once BEFORE you're in front of HOD, confirm you get at least one clone and one kill event with your chosen thresholds — if nothing happens, loosen the profit goal / loss limit sliders and re-run until you get some lineage activity to show
-- Have `data/price_data.csv` already generated and committed — don't fetch live during the demo
-- Walk through pages in order: Market (context) → Overview (big picture) → Agents (population) → Agent Detail (drill into one agent's actual reasoning) — this tells a clear story
 
 ## If something breaks
 - **`ModuleNotFoundError`** — you forgot to activate the venv or run `pip install -r requirements.txt`
