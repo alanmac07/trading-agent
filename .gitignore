@@ -1,0 +1,13 @@
+# Virtual Environment (ignore the whole venv folder)
+venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Execution logs and temp checkpoints
+*.log
+neat-checkpoint-*
+
+# Intermediate generated dataset dumps (keep source data)
+data/neat_*
