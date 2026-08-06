@@ -44,7 +44,8 @@ import ta
 TICKERS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL","BTC-USD"]   # add/remove tickers freely
 PERIOD = "5y"              # 5 years gives enough data for training a model, not just backtesting
 INTERVAL = "1d"            # daily candles (swing trading, not day trading)
-SAVE_PATH = "data/price_data.csv"
+SAVE_PATH = "data/price_data_multi.csv"  # canonical raw file -- feature_engineering.py,
+                                          # neat_engine/build_dataset.py, and app.py all read this name
 # -------------------------------
 
 

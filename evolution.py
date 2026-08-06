@@ -18,6 +18,12 @@ import numpy as np
 import pandas as pd
 from agent import Agent
 
+try:
+    from neat_engine.features import compute_extended_features
+    HAS_EXTENDED_FEATURES = True
+except ImportError:
+    HAS_EXTENDED_FEATURES = False
+
 
 class EvolutionEngine:
     def __init__(
@@ -31,6 +37,7 @@ class EvolutionEngine:
         max_agents: int = 15,
         start_offset: int = 0,
         agent_class=Agent,
+        fee_pct: float = 0.001,
     ):
         # Normalise: Date must be a plain column (not the index)
         self.data = data.copy()
@@ -42,6 +49,15 @@ class EvolutionEngine:
         if "is_synthetic" not in self.data.columns:
             self.data["is_synthetic"] = False
 
+        if HAS_EXTENDED_FEATURES and "Close" in self.data.columns and "High" in self.data.columns:
+            try:
+                is_synth = self.data["is_synthetic"].copy()
+                self.data = compute_extended_features(self.data)
+                self.data["is_synthetic"] = is_synth
+                self.data = self.data.bfill().ffill().fillna(0.0)
+            except Exception:
+                pass
+
         self.starting_capital      = starting_capital
         self.profit_goal_pct       = profit_goal_pct
         self.loss_limit_pct        = loss_limit_pct
@@ -49,6 +65,7 @@ class EvolutionEngine:
         self.checkpoint_days       = checkpoint_days
         self.max_agents            = max_agents
         self.agent_class           = agent_class
+        self.fee_pct               = fee_pct
 
         # Clamp start_offset so we always have at least 3 checkpoints of real data
         max_offset = max(0, len(self.data) - checkpoint_days * 3)
@@ -58,6 +75,8 @@ class EvolutionEngine:
         self.agents:    dict[str, Agent] = {}
         self.graveyard: list[dict]       = []
         self.events:    list[dict]       = []
+        self.graveyard_pool: float       = 0.0  # capital recovered from dead agents,
+                                                  # reinvested into the next clone
 
         seed = self._make_agent(
             capital=starting_capital, genome=None, parent_id=None, generation=0
@@ -174,20 +193,37 @@ class EvolutionEngine:
         }).dropna()
 
         self.data = pd.concat([self.data, new_rows], ignore_index=True)
+        if HAS_EXTENDED_FEATURES:
+            try:
+                is_synth = self.data["is_synthetic"].copy()
+                self.data = compute_extended_features(self.data)
+                self.data["is_synthetic"] = is_synth
+                self.data = self.data.bfill().ffill().fillna(0.0)
+            except Exception:
+                pass
 
     # ── per-day trade execution ───────────────────────────────────────────────
 
-    def _trade_one_day(self, agent: Agent, row) -> None:
+    def _trade_one_day(self, agent: Agent, row, fee_pct: float | None = None) -> None:
+        fee = self.fee_pct if fee_pct is None else fee_pct
         price  = float(row["Close"])
         action, reason = agent.decide(row)
+        exec_price = price
 
         if action == "BUY" and agent.capital > 0 and price > 0:
-            invest          = agent.capital * agent.genome["position_size_pct"]
-            agent.position += invest / price
+            exec_price = price * (1.0 + fee)
+            pos_size = (
+                agent.genome.get("position_size_pct", 0.8)
+                if isinstance(agent.genome, dict)
+                else 0.8
+            )
+            invest          = agent.capital * pos_size
+            agent.position += invest / exec_price
             agent.capital  -= invest
 
         elif action == "SELL" and agent.position > 0:
-            agent.capital  += agent.position * price
+            exec_price = price * (1.0 - fee)
+            agent.capital  += agent.position * exec_price
             agent.position  = 0.0
 
         val      = agent.portfolio_value(price)
@@ -198,10 +234,12 @@ class EvolutionEngine:
         agent.decision_log.append({
             "date":            date_str,
             "price":           round(price, 2),
-            "rsi":             round(float(row["RSI"]), 2),
+            "exec_price":      round(exec_price, 2),
+            "rsi":             round(float(row["RSI"]), 2) if "RSI" in row and pd.notna(row["RSI"]) else 0.0,
             "action":          action,
             "reason":          reason,
             "portfolio_value": round(val, 2),
+            "fee_pct":         fee,
         })
         agent.portfolio_history.append(round(val, 2))
         agent.date_history.append(date_str)
@@ -294,9 +332,15 @@ class EvolutionEngine:
         # Adjust parent's initial capital base so its return % remains proportional to remaining capital
         parent.initial_capital = max(1.0, parent.initial_capital - transfer)
 
+        # Reinvest any capital recovered from dead agents into this new clone,
+        # instead of leaving it sitting idle outside the active population.
+        pool_bonus = self.graveyard_pool
+        self.graveyard_pool = 0.0
+        child_capital = transfer + pool_bonus
+
         child_genome = self._mutate_away_from_graveyard(parent.genome)
         child = self._make_agent(
-            capital=transfer,
+            capital=child_capital,
             genome=child_genome,
             parent_id=parent.id,
             generation=parent.generation + 1,
@@ -311,13 +355,20 @@ class EvolutionEngine:
             "parent_return_pct":  round(ret_pct, 2),
             "parent_genome":      dict(parent.genome),
             "child_genome":       dict(child_genome),
+            "pool_bonus":         round(pool_bonus, 2),
         })
 
     def _kill(self, agent: Agent, day_index: int, ret_pct: float) -> None:
         agent.status          = "dead"
         agent.cause_of_death  = (
-            f"Return {ret_pct:.1f}% breached loss limit of −{self.loss_limit_pct:.1f}%"
+            f"Return {ret_pct:.1f}% breached loss limit of -{self.loss_limit_pct:.1f}%"
         )
+        # Recovered capital doesn't vanish -- it goes into a pool that funds
+        # the next clone instead of sitting dead with this agent forever.
+        recovered = agent.capital
+        self.graveyard_pool += recovered
+        agent.capital = 0.0
+
         self.graveyard.append({
             "id":     agent.id,
             "genome": dict(agent.genome),
@@ -328,4 +379,5 @@ class EvolutionEngine:
             "day_index": day_index,
             "agent":     agent.id,
             "cause":     agent.cause_of_death,
+            "recovered_capital": round(recovered, 2),
         })

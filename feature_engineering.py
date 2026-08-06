@@ -15,7 +15,7 @@ Run: python feature_engineering.py
 import pandas as pd
 import numpy as np
 
-RAW_PATH = "data/price_data_multi.csv"
+RAW_PATH = "data/price_data.csv"
 TRAIN_PATH = "data/train.csv"
 TEST_PATH = "data/test.csv"
 TRAIN_FRACTION = 0.8  # first 80% of each ticker's history = train, last 20% = test

@@ -11,8 +11,10 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import networkx as nx
 
 from evolution import EvolutionEngine
+from neuro_agent import NeuroAgent, TrainedNeatAgent
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -36,6 +38,16 @@ st.markdown("""
 html, body, [class*="st-"], .stApp {
     font-family: 'Inter', sans-serif !important;
     color: #e2e8f0 !important;
+}
+
+/* The rule above is broad enough to also override Streamlit's Material
+   Symbols icon font (used for the sidebar collapse arrow, popover chevrons,
+   etc.), which makes those icons fall back to rendering their literal
+   ligature name as text -- e.g. "expand_less" showing up as visible text
+   instead of a chevron glyph. Excluding icon elements fixes it. */
+[data-testid="stIconMaterial"],
+[data-testid="stIconMaterial"] * {
+    font-family: 'Material Symbols Rounded', 'Material Icons' !important;
 }
 
 .stApp {
@@ -173,8 +185,11 @@ _DEFAULTS = {
     "clone_frac":        0.5,
     "checkpoint_days":   20,
     "max_agents":        15,
+    "fee_pct":           0.001,  # 0.1% per trade slippage & friction
+    "include_neat_agent": False,
     "playback_delay":    0.05,
     "days_per_frame":    3,
+    "selected_ticker":   None,   # set once data loads, below
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -185,7 +200,7 @@ for _k, _v in _DEFAULTS.items():
 # ══════════════════════════════════════════════════════════════════════════════
 @st.cache_data
 def load_data():
-    df = pd.read_csv("data/price_data.csv", parse_dates=["Date"])
+    df = pd.read_csv("data/price_data_multi.csv", parse_dates=["Date"])
     return df
 
 try:
@@ -193,6 +208,26 @@ try:
     data_loaded = True
 except FileNotFoundError:
     data_loaded = False
+
+if data_loaded:
+    # All simulation/chart logic below assumes ONE continuous, date-sorted
+    # series. price_data_multi.csv has multiple tickers concatenated back to
+    # back (not interleaved by date) -- feeding the raw multi-ticker frame
+    # straight into a row-walking simulator mixes unrelated stocks into one
+    # fake series. Every consumer must filter to a single ticker first.
+    AVAILABLE_TICKERS = sorted(price_data["Ticker"].unique().tolist())
+    if st.session_state.selected_ticker not in AVAILABLE_TICKERS:
+        st.session_state.selected_ticker = AVAILABLE_TICKERS[0]
+
+    def get_ticker_data(ticker: str) -> pd.DataFrame:
+        """Single-ticker slice, date-sorted, index reset -- safe to feed to EvolutionEngine or chart directly."""
+        return (
+            price_data[price_data["Ticker"] == ticker]
+            .sort_values("Date")
+            .reset_index(drop=True)
+        )
+else:
+    AVAILABLE_TICKERS = []
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CHART HELPERS
@@ -273,14 +308,31 @@ def _pct_color(v: float) -> str:
 with st.sidebar:
     st.markdown("### 🧬 Trading Agent Swarm")
     if data_loaded:
-        st.caption("All simulation parameters now live on the **⚙️ Settings** page (top nav).")
+        st.selectbox(
+            "📈 Ticker", AVAILABLE_TICKERS, key="selected_ticker",
+            disabled=st.session_state.sim_running or st.session_state.sim_engine is not None,
+            help="Changing this only takes effect on the next Start/Reset -- it won't swap mid-simulation.",
+        )
+        st.caption("All other simulation parameters live on the **⚙️ Settings** page (top nav).")
         st.divider()
         st.markdown(f"**Starting capital:** ${st.session_state.starting_capital:,.0f}")
         st.markdown(f"**Profit goal:** +{st.session_state.profit_goal_pct}%")
-        st.markdown(f"**Loss limit:** −{st.session_state.loss_limit_pct}%")
+        st.markdown(f"**Loss limit:** -{st.session_state.loss_limit_pct}%")
+        st.markdown(f"**Slippage & fee:** {st.session_state.fee_pct * 100:.2f}%")
         st.markdown(f"**Max alive agents:** {st.session_state.max_agents}")
+        st.checkbox(
+            "🤖 Include NEAT Champion",
+            key="include_neat_agent_sidebar",
+            disabled=st.session_state.sim_running or st.session_state.sim_engine is not None,
+            help="Injects the pre-trained champion NEAT neural network agent into the live simulation swarm.",
+        )
+        engine = st.session_state.get("sim_engine")
+        if engine is not None:
+            st.divider()
+            st.markdown(f"**💰 Graveyard pool:** ${engine.graveyard_pool:,.2f}")
+            st.caption("Recovered capital from dead agents, waiting to fund the next clone.")
     else:
-        st.error("`data/price_data.csv` not found.\nRun `python fetch_data.py` first.")
+        st.error("`data/price_data_multi.csv` not found.\nRun `python fetch_data.py` first.")
 
 # Read current settings from session_state (edited on the Settings page)
 starting_capital = st.session_state.starting_capital
@@ -362,34 +414,29 @@ def render_live_page():
     # ── Controls row ────────────────────────────────────────────────────────
     ctrl_left, ctrl_right = st.columns([3, 2.5])
     with ctrl_left:
-        st.markdown("## ▶ Live Simulation")
+        st.markdown(f"## ▶ Live Simulation — `{st.session_state.selected_ticker}`")
 
     with ctrl_left:
         gear_col, _ = st.columns([1, 6])
         with gear_col:
             with st.popover("⚙️", use_container_width=False):
                 st.markdown("**Configure Simulation**")
-                _cap  = st.number_input("Starting capital ($)", min_value=100,
-                            value=st.session_state.starting_capital, step=500, key="_cfg_cap")
-                _pg   = st.slider("Profit goal to clone (%)", 1, 50,
-                            value=st.session_state.profit_goal_pct, key="_cfg_pg")
-                _ll   = st.slider("Loss limit to terminate (%)", 1, 50,
-                            value=st.session_state.loss_limit_pct, key="_cfg_ll")
-                _cf   = st.slider("Capital fraction to clone", 0.1, 0.9,
-                            value=st.session_state.clone_frac, key="_cfg_cf")
-                _ckd  = st.slider("Days between checkpoints", 5, 60,
-                            value=st.session_state.checkpoint_days, key="_cfg_ckd")
-                _ma   = st.slider("Max alive agents", 2, 30,
-                            value=st.session_state.max_agents, key="_cfg_ma")
-                if st.button("💾 Save Changes", type="primary", use_container_width=True):
-                    st.session_state.starting_capital = _cap
-                    st.session_state.profit_goal_pct   = _pg
-                    st.session_state.loss_limit_pct    = _ll
-                    st.session_state.clone_frac        = _cf
-                    st.session_state.checkpoint_days   = _ckd
-                    st.session_state.max_agents        = _ma
-                    st.success("Saved — takes effect next time you click Start.")
-                    st.rerun()
+                st.caption("Changes apply immediately -- same settings as the ⚙️ Settings page.")
+                st.number_input("Starting capital ($)", min_value=100,
+                            step=500, key="starting_capital")
+                st.slider("Profit goal to clone (%)", 1, 50, key="profit_goal_pct")
+                st.slider("Loss limit to terminate (%)", 1, 50, key="loss_limit_pct")
+                fee_val = st.slider("Slippage & fee per trade (%)", 0.0, 1.0, value=float(st.session_state.fee_pct * 100), step=0.05, format="%.2f%%")
+                st.session_state.fee_pct = fee_val / 100.0
+                st.slider("Capital fraction to clone", 0.1, 0.9, key="clone_frac")
+                st.slider("Days between checkpoints", 5, 60, key="checkpoint_days")
+                st.slider("Max alive agents", 2, 30, key="max_agents")
+                st.checkbox(
+                    "🤖 Include NEAT Champion",
+                    key="include_neat_agent_popover",
+                    disabled=st.session_state.sim_running or st.session_state.sim_engine is not None,
+                    help="Injects the pre-trained champion NEAT agent into the swarm.",
+                )
         
     with ctrl_right:
         c1, c2, c3, c4 = st.columns(4)
@@ -413,9 +460,10 @@ def render_live_page():
 
     # ── Start ────────────────────────────────────────────────────────────────
     if start_btn and not st.session_state.sim_running:
-        start_offset = random.randint(0, max(0, len(price_data) - checkpoint_days * 10))
+        ticker_data = get_ticker_data(st.session_state.selected_ticker)
+        start_offset = random.randint(0, max(0, len(ticker_data) - checkpoint_days * 10))
         engine = EvolutionEngine(
-            data=price_data,
+            data=ticker_data,
             starting_capital=starting_capital,
             profit_goal_pct=profit_goal_pct,
             loss_limit_pct=loss_limit_pct,
@@ -423,7 +471,22 @@ def render_live_page():
             checkpoint_days=checkpoint_days,
             max_agents=max_agents,
             start_offset=start_offset,
+            fee_pct=st.session_state.fee_pct,
         )
+        if (st.session_state.get("include_neat_agent_sidebar", False) or
+            st.session_state.get("include_neat_agent_popover", False) or
+            st.session_state.get("include_neat_agent_settings", False) or
+            st.session_state.get("include_neat_agent", False)):
+            try:
+                neat_agent = TrainedNeatAgent(
+                    agent_id="NEAT_Champion",
+                    capital=starting_capital,
+                    color="#00FF88",
+                )
+                engine.agents[neat_agent.id] = neat_agent
+            except Exception as ex:
+                st.warning(f"Could not load pre-trained NEAT Champion: {ex}")
+
         st.session_state.sim_engine    = engine
         st.session_state.sim_generator = engine.run_live()
         st.session_state.sim_running   = True
@@ -529,7 +592,7 @@ def render_live_page():
                     dash="dot" if a.status == "dead" else "solid",
                 ),
                 opacity=0.45 if a.status == "dead" else 1.0,
-                hovertemplate=f"<b>{a.id}</b><br>${'{y:.2f}'}<extra></extra>",
+                hovertemplate=f"<b>{a.id}</b><br>$%{{y:.2f}}<extra></extra>",
             ))
         fig_pf.update_layout(**_clayout("💼 Agent Portfolios", 380))
         port_ph.plotly_chart(fig_pf, use_container_width=True, key="live_portfolio_chart")
@@ -540,17 +603,21 @@ def render_live_page():
         lines = []
         for e in reversed(evts[-12:]):
             if e["type"] == "CLONE":
+                bonus = e.get("pool_bonus", 0.0)
+                bonus_note = f" (+${bonus:,.0f} from graveyard pool)" if bonus > 0 else ""
                 lines.append(
                     f"🧬 Day {e['day_index']:,} — **{e['parent']}** (+{e['parent_return_pct']}%) "
-                    f"→ spawned **{e['child']}**"
+                    f"→ spawned **{e['child']}**{bonus_note}"
                 )
             elif e["type"] == "RESPAWN":
                 lines.append(
                     f"🌱 Day {e['day_index']:,} — **{e['agent']}** auto-respawned: {e['cause']}"
                 )
             else:
+                recovered = e.get("recovered_capital", 0.0)
                 lines.append(
-                    f"☠️ Day {e['day_index']:,} — **{e['agent']}** terminated: {e['cause']}"
+                    f"☠️ Day {e['day_index']:,} — **{e['agent']}** terminated: {e['cause']} "
+                    f"(${recovered:,.0f} recovered to pool)"
                 )
         event_ph.markdown(
             "<div style='background:rgba(255,255,255,0.02);border:1px solid "
@@ -605,17 +672,20 @@ def render_live_page():
 #  PAGE: MARKET
 # ══════════════════════════════════════════════════════════════════════════════
 def render_market_page():
-    st.markdown("## 📊 Market Data")
+    ticker = st.session_state.selected_ticker
+    st.markdown(f"## 📊 Market Data — `{ticker}`")
     st.caption("Historical price data every agent trades against. Synthetic extension shown in purple.")
 
     if not data_loaded:
-        st.error("`data/price_data.csv` not found — run `python fetch_data.py` first.")
+        st.error("`data/price_data_multi.csv` not found — run `python fetch_data.py` first.")
         return
 
-    # Always use raw CSV as base; overlay synthetic extension if a simulation ran
-    df = price_data.copy()
+    # Always use the single-ticker slice as base; overlay synthetic extension
+    # if a simulation ran (engine.data is already single-ticker too, since
+    # EvolutionEngine is only ever fed one ticker's rows -- see render_live_page)
+    df = get_ticker_data(ticker)
     engine = st.session_state.get("engine")
-    if engine is not None and len(engine.data) > len(price_data):
+    if engine is not None and len(engine.data) > len(df):
         df = engine.data.copy()
 
     # ── Summary metrics ──────────────────────────────────────────────────────
@@ -861,15 +931,169 @@ def render_pnl_page(engine: EvolutionEngine):
     )
 
 
+def render_lineage_tree(engine: EvolutionEngine) -> go.Figure:
+    """
+    Builds an interactive directed lineage network graph (nx.DiGraph) from engine.agents,
+    displaying parent-to-child clone relationships across evolutionary generations.
+    Alive agents are rendered as circles; dead/terminated agents are rendered as 'x' markers.
+    Hover tooltips display Agent ID, Generation, Return %, and Status.
+    """
+    G = nx.DiGraph()
+    all_agents = list(engine.agents.values())
+    if not all_agents:
+        fig = go.Figure()
+        fig.update_layout(**_clayout("🧬 Swarm Lineage Tree (No Agents)", 300))
+        return fig
+
+    for a in all_agents:
+        G.add_node(a.id, agent=a)
+
+    for a in all_agents:
+        if a.parent_id and a.parent_id in engine.agents:
+            G.add_edge(a.parent_id, a.id)
+
+    # Compute hierarchical positions: x = generation, y = vertically distributed
+    by_gen: dict[int, list] = {}
+    for a in all_agents:
+        by_gen.setdefault(a.generation, []).append(a)
+
+    pos = {}
+    max_count = max(len(ags) for ags in by_gen.values())
+    for gen, ags in by_gen.items():
+        n = len(ags)
+        spacing = 1.0 if n <= 1 else max(1.0, (max_count - 1) / (n - 1))
+        for i, a in enumerate(ags):
+            y = (i - (n - 1) / 2.0) * spacing
+            pos[a.id] = (gen, y)
+
+    last_price = float(engine.data["Close"].iloc[-1]) if "Close" in engine.data.columns else 100.0
+
+    # Lineage edges
+    edge_x, edge_y = [], []
+    for u, v in G.edges():
+        if u in pos and v in pos:
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
+
+    fig = go.Figure()
+
+    if edge_x:
+        fig.add_trace(go.Scatter(
+            x=edge_x,
+            y=edge_y,
+            mode="lines",
+            line=dict(color="rgba(148, 163, 184, 0.45)", width=2),
+            hoverinfo="none",
+            name="Clone Lineage",
+            showlegend=False,
+        ))
+
+    alive_x, alive_y, alive_colors, alive_text, alive_names = [], [], [], [], []
+    dead_x, dead_y, dead_colors, dead_text, dead_names = [], [], [], [], []
+
+    for a in all_agents:
+        x, y = pos[a.id]
+        ret = a.return_pct(last_price)
+        status_str = "ALIVE" if a.status == "alive" else "TERMINATED"
+        tooltip = (
+            f"<b>Agent ID:</b> {a.id}<br>"
+            f"<b>Generation:</b> Gen {a.generation}<br>"
+            f"<b>Parent:</b> {a.parent_id or '— Seed Agent'}<br>"
+            f"<b>Return:</b> {ret:+.2f}%<br>"
+            f"<b>Status:</b> {status_str}<extra></extra>"
+        )
+        if a.status == "alive":
+            alive_x.append(x)
+            alive_y.append(y)
+            alive_colors.append(a.color)
+            alive_text.append(tooltip)
+            alive_names.append(a.id)
+        else:
+            dead_x.append(x)
+            dead_y.append(y)
+            dead_colors.append(a.color)
+            dead_text.append(tooltip)
+            dead_names.append(a.id)
+
+    if alive_x:
+        fig.add_trace(go.Scatter(
+            x=alive_x,
+            y=alive_y,
+            mode="markers+text",
+            marker=dict(
+                symbol="circle",
+                size=24,
+                color=alive_colors,
+                line=dict(color="#ffffff", width=2),
+            ),
+            text=alive_names,
+            textposition="top center",
+            textfont=dict(color="#f8fafc", size=11, family="Inter, sans-serif"),
+            hovertemplate="%{hovertext}",
+            hovertext=alive_text,
+            name="Alive Agents",
+        ))
+
+    if dead_x:
+        fig.add_trace(go.Scatter(
+            x=dead_x,
+            y=dead_y,
+            mode="markers+text",
+            marker=dict(
+                symbol="x",
+                size=20,
+                color=dead_colors,
+                line=dict(color=dead_colors, width=3),
+            ),
+            text=dead_names,
+            textposition="top center",
+            textfont=dict(color="#94a3b8", size=10, family="Inter, sans-serif"),
+            hovertemplate="%{hovertext}",
+            hovertext=dead_text,
+            name="Terminated Agents",
+        ))
+
+    all_gens = sorted(by_gen.keys())
+    gen_ticks = ["Seed (Gen 0)" if g == 0 else f"Gen {g}" for g in all_gens]
+
+    layout_dict = _clayout("🌳 Swarm Lineage & Clone Evolution Tree", height=420)
+    layout_dict["xaxis"] = dict(
+        title=dict(text="Evolutionary Generation", font=dict(color="#94a3b8", size=12)),
+        tickmode="array",
+        tickvals=all_gens,
+        ticktext=gen_ticks,
+        gridcolor="rgba(255,255,255,0.05)",
+        showgrid=True,
+        zeroline=False,
+    )
+    layout_dict["yaxis"] = dict(visible=False, showgrid=False, zeroline=False)
+    layout_dict["showlegend"] = True
+    layout_dict["legend"] = dict(
+        orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+        font=dict(color="#94a3b8", size=11),
+    )
+    layout_dict["hovermode"] = "closest"
+    fig.update_layout(**layout_dict)
+    return fig
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PAGE: AGENTS (cards only – click to navigate to detail)
 # ══════════════════════════════════════════════════════════════════════════════
 def render_agents_page(engine: EvolutionEngine):
-    st.markdown("## 🧬 Agents")
+    st.markdown("## 🧬 Agents & Lineage")
     st.caption(
-        "Click an agent card to see its full detail, thinking log, and genome. "
+        "Explore agent genealogy, parent-to-child clone relationships, and individual genome configurations. "
         "Dashed sparklines = terminated agents."
     )
+
+    # ── Interactive Lineage Tree ──
+    fig_tree = render_lineage_tree(engine)
+    st.plotly_chart(fig_tree, use_container_width=True, key="agent_lineage_tree")
+
+    st.divider()
 
     all_agents = list(engine.agents.values())
     last_price  = float(engine.data["Close"].iloc[-1])
@@ -1085,14 +1309,25 @@ def render_settings_page():
         )
         st.slider("Profit goal to clone (%)", 1, 50, key="profit_goal_pct")
         st.slider("Loss limit to terminate (%)", 1, 50, key="loss_limit_pct")
+        fee_s = st.slider(
+            "Slippage & fee per trade (%)", 0.0, 1.0,
+            value=float(st.session_state.fee_pct * 100), step=0.05,
+            format="%.2f%%",
+        )
+        st.session_state.fee_pct = fee_s / 100.0
         st.slider("Capital fraction given to clone", 0.1, 0.9, step=0.05, key="clone_frac")
 
     with c2:
-        st.markdown("### ⏱ Execution & Population")
+        st.markdown("### ⏱ Execution & Swarm Models")
         st.slider("Days between checkpoints", 5, 60, key="checkpoint_days")
         st.slider("Max alive agents", 2, 30, key="max_agents")
         st.slider("Playback frame delay (seconds)", 0.0, 2.0, step=0.01, key="playback_delay")
         st.slider("Days simulated per frame", 1, 30, key="days_per_frame")
+        st.checkbox(
+            "🤖 Include Pre-trained NEAT Champion Agent",
+            key="include_neat_agent_settings",
+            help="Spawns the champion NEAT genome alongside the swarm on simulation start.",
+        )
 
     st.divider()
     st.markdown("### Current configuration")
@@ -1100,9 +1335,11 @@ def render_settings_page():
         "starting_capital": st.session_state.starting_capital,
         "profit_goal_pct": st.session_state.profit_goal_pct,
         "loss_limit_pct": st.session_state.loss_limit_pct,
+        "slippage_fee_pct": f"{st.session_state.fee_pct * 100:.2f}%",
         "clone_capital_fraction": st.session_state.clone_frac,
         "checkpoint_days": st.session_state.checkpoint_days,
         "max_agents": st.session_state.max_agents,
+        "include_neat_agent": st.session_state.get("include_neat_agent_settings", False),
         "playback_delay_sec": st.session_state.playback_delay,
         "days_per_frame": st.session_state.days_per_frame,
     })
