@@ -1,14 +1,19 @@
 """
 neat_engine/evaluate_holdout.py
 
-Run AFTER training: python -m neat_engine.evaluate_holdout
-Loads results/best_genome.pkl and tests it on data/test_extended.csv --
-data the genome never saw during evolution. This number, not the
-training fitness, is the one that goes in your report.
+Run AFTER training:
+  python -m neat_engine.evaluate_holdout --market stocks
+  python -m neat_engine.evaluate_holdout --market crypto
+  python -m neat_engine.evaluate_holdout --market macro
+  python -m neat_engine.evaluate_holdout  (universal)
+
+Loads results/best_genome_{market}.pkl (with fallback to results/best_genome.pkl)
+and tests on data/test_{market}.csv.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import pickle
 
@@ -21,8 +26,6 @@ from .network_agent import NeatTradingAgent
 from .risk_manager import decide_trade
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config-feedforward.txt")
-TEST_CSV = "data/test_extended.csv"
-GENOME_PATH = "results/best_genome.pkl"
 
 
 def evaluate_on_ticker(agent: NeatTradingAgent, df: pd.DataFrame) -> dict:
@@ -72,18 +75,58 @@ def evaluate_on_ticker(agent: NeatTradingAgent, df: pd.DataFrame) -> dict:
     }
 
 
+def resolve_paths(market: str | None = None, genome_override: str | None = None, test_csv_override: str | None = None):
+    # Resolve test CSV
+    if test_csv_override:
+        test_csv = test_csv_override
+    elif market and os.path.exists(f"data/test_{market}.csv"):
+        test_csv = f"data/test_{market}.csv"
+    else:
+        test_csv = "data/test_extended.csv"
+
+    # Resolve Genome
+    if genome_override:
+        genome_path = genome_override
+    elif market and os.path.exists(f"results/best_genome_{market}.pkl"):
+        genome_path = f"results/best_genome_{market}.pkl"
+    elif os.path.exists("results/best_genome.pkl"):
+        genome_path = "results/best_genome.pkl"
+    elif os.path.exists("best_genome_AAPL.pkl"):
+        genome_path = "best_genome_AAPL.pkl"
+    else:
+        raise FileNotFoundError("No trained genome found. Run neat_engine.trainer first.")
+
+    return test_csv, genome_path
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Evaluate trained NEAT models on holdout test data.")
+    parser.add_argument("--market", type=str, default=None, choices=["stocks", "crypto", "macro", None], help="Market regime")
+    parser.add_argument("--genome", type=str, default=None, help="Explicit path to genome pickle file")
+    parser.add_argument("--test-csv", type=str, default=None, help="Explicit path to test CSV file")
+    args = parser.parse_args()
+
+    market_str = args.market.lower() if args.market else None
+    test_csv, genome_path = resolve_paths(market_str, args.genome, args.test_csv)
+
+    print(f"=== Holdout Evaluation ===")
+    print(f"Market Regime:   {market_str.upper() if market_str else 'UNIVERSAL'}")
+    print(f"Loaded Genome:   {genome_path}")
+    print(f"Test Dataset:    {test_csv}")
+    print(f"==========================\n")
+
     config = neat.Config(
         neat.DefaultGenome, neat.DefaultReproduction,
         neat.DefaultSpeciesSet, neat.DefaultStagnation,
         CONFIG_PATH,
     )
-    with open(GENOME_PATH, "rb") as f:
+    with open(genome_path, "rb") as f:
         genome = pickle.load(f)
     agent = NeatTradingAgent(genome, config)
 
-    test_df = pd.read_csv(TEST_CSV, parse_dates=["Date"])
+    test_df = pd.read_csv(test_csv, parse_dates=["Date"])
     print(f"{'Ticker':<10} {'Return %':>10} {'Sharpe':>8} {'MaxDD %':>9} {'Trades':>7} {'FinalVal':>10}")
+    print("-" * 60)
     for ticker, group in test_df.groupby("Ticker"):
         result = evaluate_on_ticker(agent, group.sort_values("Date"))
         print(f"{result['ticker']:<10} {result['total_return_pct']:>10} {result['sharpe_ratio']:>8} "
